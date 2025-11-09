@@ -9,50 +9,63 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import androidx.lifecycle.*
 
+// ViewModel responsible for managing and exposing user list UI state.
 class UserListViewModel(
-    private val userRepository: UserRepository,
-    savedStateHandle: SavedStateHandle
+    private val userRepository: UserRepository,          // Repository providing user data
+    savedStateHandle: SavedStateHandle                   // Used to persist/restore UI state (like search query)
 ) : ViewModel() {
-    
+
+    // Backing StateFlow for UI state (Loading, Success, Error)
     private val _state = MutableStateFlow<UserListState>(UserListState.Loading)
-    val state: StateFlow<UserListState> = _state.asStateFlow()
-    
+    val state: StateFlow<UserListState> = _state.asStateFlow()   // Exposed as read-only StateFlow
+
+    // SharedFlow for one-time error events (e.g., to show a Snackbar)
     private val _error = MutableSharedFlow<String>()
     val error: SharedFlow<String> = _error.asSharedFlow()
-    
+
+    // Tracks loading progress (e.g., show/hide progress bar)
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
-    
-    // Handle search query with debouncing
+
+    // Search query handling using LiveData from SavedStateHandle.
+    // Converts to Flow, adds debounce and distinctUntilChanged for better UX.
     val searchQuery = savedStateHandle.getLiveData<String>("searchQuery", "")
-        .asFlow()
-        .debounce(300L)
-        .filter { it.length >= 2 || it.isEmpty() }
-        .distinctUntilChanged()
-        .flatMapLatest { query ->
+        .asFlow()                                      // Convert LiveData to Flow for reactive operators
+        .debounce(300L)                                // Wait 300ms after user stops typing
+        .filter { it.length >= 2 || it.isEmpty() }     // Ignore very short queries (less than 2 chars)
+        .distinctUntilChanged()                        // Only react when query actually changes
+        .flatMapLatest { query ->                      // Cancel old searches when a new one starts
             if (query.isEmpty()) {
+                // Empty query → emit empty user list
                 flowOf(UserListState.Success(emptyList()))
             } else {
+                // Non-empty query → perform search
                 userRepository.searchUsers(query)
-                    .map { UserListState.Success(it) }
-                    .catch { throwable ->
+                    .map { UserListState.Success(it) }  // Map successful result to Success state
+                    .catch { throwable ->               // Handle errors during search
                         _error.emit(throwable.message ?: "Unknown error")
                         emit(UserListState.Error(throwable.message ?: "Error"))
                     }
-                    .onStart { _isLoading.value = true }
-                    .onCompletion { _isLoading.value = false }
+                    .onStart { _isLoading.value = true }        // Set loading flag before search starts
+                    .onCompletion { _isLoading.value = false }  // Reset loading flag after search ends
             }
         }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), UserListState.Loading)
-    
-    // Manual refresh function
+        // Convert to StateFlow so it always holds the latest state and can be observed from UI
+        .stateIn(
+            viewModelScope,                              // Scope tied to ViewModel lifecycle
+            SharingStarted.WhileSubscribed(5000L),        // Keeps flow active while UI is observing
+            UserListState.Loading                         // Initial state
+        )
+
+    // Function to manually refresh the full user list (e.g., pull-to-refresh)
     fun refreshUsers() {
         viewModelScope.launch {
-            _state.value = UserListState.Loading
+            _state.value = UserListState.Loading          // Show loading state
             try {
-                val users = userRepository.getAllUsers()
+                val users = userRepository.getAllUsers()  // Fetch from repository
                 _state.value = UserListState.Success(users)
             } catch (e: Exception) {
+                // Handle errors gracefully
                 _state.value = UserListState.Error(e.message ?: "Refresh failed")
                 _error.emit(e.message ?: "Unknown error")
             }
@@ -60,39 +73,44 @@ class UserListViewModel(
     }
 }
 
-// State classes
+// Represents the possible UI states for the user list screen.
 sealed class UserListState {
-    object Loading : UserListState()
-    data class Success(val users: List<User>) : UserListState()
-    data class Error(val message: String) : UserListState()
+    object Loading : UserListState()                      // UI is loading data
+    data class Success(val users: List<User>) : UserListState() // Successfully loaded users
+    data class Error(val message: String) : UserListState()      // Error occurred
 }
 
+// Simple data model representing a user.
 data class User(val id: Int, val name: String, val email: String)
 
-// Repository with cache
+// Repository that handles user data from remote and local sources, with in-memory caching.
 class UserRepository {
-    private val remoteDataSource = UserRemoteDataSource()
-    private val localDataSource = UserLocalDataSource()
-    private val cache = mutableMapOf<Int, User>()
-    
+    private val remoteDataSource = UserRemoteDataSource()   // Simulates network source
+    private val localDataSource = UserLocalDataSource()     // Simulates local database
+    private val cache = mutableMapOf<Int, User>()           // In-memory cache
+
+    // Searches for users by name, emitting results from cache, then remote, then local fallback.
     suspend fun searchUsers(query: String): Flow<List<User>> {
         return flow {
-            // First emit cached results
+            // 1️⃣ Emit cached results immediately if available
             val cached = cache.values.filter { it.name.contains(query, ignoreCase = true) }
             if (cached.isNotEmpty()) {
                 emit(cached)
             }
-            
-            // Then fetch from network
+
+            // 2️⃣ Try fetching fresh results from remote source
             try {
                 val remote = remoteDataSource.searchUsers(query)
+                // Update cache and local database
                 remote.forEach { cache[it.id] = it }
                 localDataSource.saveUsers(remote)
+                // Emit updated cached results
                 emit(cache.values.filter { it.name.contains(query, ignoreCase = true) })
             } catch (e: Exception) {
-                // If network fails, emit local data
+                // 3️⃣ If network fails, fall back to local database
                 val local = localDataSource.getUsersByName(query)
                 emit(local)
+                // Rethrow exception so ViewModel can handle it
                 throw e
             }
         }
